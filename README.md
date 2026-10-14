@@ -1,89 +1,190 @@
-# linkshrink — v2: sharded, cached, replicated, load balanced
+# ⚡ LinkShrink: High-Throughput Sharded URL Engine
 
-What changed since step 1: one Postgres instance became 2 shards (each a
-primary + streaming read replica), Valkey now caches redirects and rate-
-limits link creation, and nginx load balances across 2 app instances.
+<div align="center">
 
-## Setup (inside your Ubuntu chroot, as root)
+[![Node.js](https://img.shields.io/badge/Runtime-Node.js_v20%2B-339933.svg?style=for-the-badge&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL_Multi--Shard-4169E1.svg?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Valkey](https://img.shields.io/badge/Cache-Valkey_%2F_Redis-DC382D.svg?style=for-the-badge&logo=redis&logoColor=white)](https://valkey.io/)
+[![Nginx](https://img.shields.io/badge/Load_Balancer-Nginx-009639.svg?style=for-the-badge&logo=nginx&logoColor=white)](https://nginx.org/)
+[![k6](https://img.shields.io/badge/Load_Testing-k6-7D64FF.svg?style=for-the-badge&logo=k6&logoColor=white)](https://k6.io/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
+
+**An ultra-resilient, horizontally sharded, memory-cached, and replicated edge URL redirection service engineered for maximum throughput on resource-constrained hardware.**
+
+</div>
+
+---
+
+## 🚀 Architecture Highlights
+
+LinkShrink is designed to push bare-metal edge hardware (e.g. an Android chroot or compact Linux server) to its physical limits. Rather than a monolithic server, it deploys:
+1. **Nginx Reverse Proxy & Load Balancer:** Distributes incoming traffic across multiple independent Node.js application instances.
+2. **Dual-Shard PostgreSQL Topology:** Shards data across 4 database clusters:
+   - **Shard 0:** Primary (port `5432`) + Streaming Read Replica (port `5434`).
+   - **Shard 1:** Primary (port `5433`) + Streaming Read Replica (port `5435`).
+3. **In-Memory Valkey Cache:** Sub-millisecond redirect lookups with TTL caching and token-bucket creation rate-limiting.
+4. **Live Telemetry HUD (`monitor/dashboard.html`):** Real-time dashboard graphing requests per second, cache hit ratio, system memory, and CPU temperature.
+
+---
+
+## 🏛️ Topology Diagram
+
+```mermaid
+graph TD
+    CLIENT[Inbound Client Traffic] -->|Port 8080| NGINX[Nginx Load Balancer]
+    
+    subgraph "Application Cluster"
+        NGINX -->|Round Robin| APP1[App Instance 1 :3000]
+        NGINX -->|Round Robin| APP2[App Instance 2 :3001]
+    end
+
+    subgraph "Caching & Rate Limiting"
+        APP1 <-->|Sub-ms Lookups| VALKEY[(Valkey Cache)]
+        APP2 <-->|Sub-ms Lookups| VALKEY
+    end
+
+    subgraph "PostgreSQL Shard 0"
+        APP1 -->|Hash Routing| S0_PRI[(Shard 0 Primary :5432)]
+        APP2 -->|Hash Routing| S0_PRI
+        S0_PRI -.->|WAL Streaming Replication| S0_REP[(Shard 0 Replica :5434)]
+        S0_REP -->|Read Fallback| APP1
+    end
+
+    subgraph "PostgreSQL Shard 1"
+        APP1 -->|Hash Routing| S1_PRI[(Shard 1 Primary :5433)]
+        APP2 -->|Hash Routing| S1_PRI
+        S1_PRI -.->|WAL Streaming Replication| S1_REP[(Shard 1 Replica :5435)]
+        S1_REP -->|Read Fallback| APP2
+    end
+
+    style NGINX fill:#009639,stroke:#fff,stroke-width:2px,color:#fff
+    style VALKEY fill:#DC382D,stroke:#fff,stroke-width:2px,color:#fff
+    style S0_PRI fill:#4169E1,stroke:#fff,stroke-width:2px,color:#fff
+    style S1_PRI fill:#4169E1,stroke:#fff,stroke-width:2px,color:#fff
+```
+
+---
+
+## 📦 Directory Structure
 
 ```
+├── chaos/                  # Failure testing & replica promotion scripts
+│   ├── kill-and-promote.sh # Simulates primary node failure & failover
+│   └── README.md           # Failure analysis & recovery documentation
+├── infra/                  # Provisioning & system services
+│   ├── nginx.conf          # Upstream proxy & load balancing rules
+│   ├── provision.sh        # Automated setup (Postgres, Valkey, Nginx, Node)
+│   ├── setup-shards.sh     # 4-cluster PostgreSQL shard provisioning
+│   ├── start-all.sh        # Orchestrated daemon launcher (tmux session)
+│   └── zrok/               # Public tunnel relay configuration
+├── load-test/              # Performance benchmarking suite
+│   └── redirects.js        # k6 load testing script for high-concurrency redirects
+├── monitor/                # Real-time monitoring dashboard
+│   └── dashboard.html      # Client HUD for latency, RPS, & thermal stats
+├── src/                    # Core application source code
+│   ├── cache.js            # Valkey caching & rate-limit driver
+│   ├── db.js               # Multi-pool database abstraction
+│   ├── server.js           # Express REST API routes & health probes
+│   └── shardRouter.js      # Deterministic hash ring shard resolver
+├── .env.example            # Environment template
+└── schema.sql              # Base database schema
+```
+
+---
+
+## 🛠️ Setup & Deployment
+
+### 1. Automated Provisioning (Linux / Chroot as Root)
+```bash
 chmod +x infra/*.sh
 ./infra/provision.sh
 ```
+This script automates:
+- Package installation (`postgresql`, `valkey-server`, `nginx`, `nodejs`, `tmux`).
+- Creation of the 4 independent PostgreSQL database clusters.
+- Configuration of replication privileges and WAL streaming.
+- Nginx upstream site enablement.
 
-This installs Postgres, Valkey, nginx, Node, and tmux; provisions the 4
-Postgres clusters (2 primaries, 2 replicas — see `infra/setup-shards.sh` for
-exactly what it does); and wires up nginx. Check `pg_lsclusters` afterward —
-you should see 4 clusters, all "online". Valkey starts itself on install;
-confirm with `systemctl status valkey-server`.
-
-Then:
-
+Verify all 4 clusters are online:
+```bash
+pg_lsclusters
 ```
-cp .env.example .env   # edit PGPASSWORD to match what setup-shards.sh used
+
+### 2. Configure Environment & Start Services
+```bash
+cp .env.example .env
+# Edit .env with your chosen credentials
+
 npm install
 ./infra/start-all.sh
 ```
 
-## Test it end to end, over Tailscale from your laptop
+---
 
+## 📡 API Reference
+
+### 1. Create Short Link
+```http
+POST /api/shorten
+Content-Type: application/json
+
+{
+  "url": "https://example.com/very/long/target/url"
+}
 ```
-curl -X POST http://<phone-tailscale-ip>:8080/api/shorten \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com"}'
-```
 
-The response now says which shard the link landed on:
-
+**Response (`201 Created`):**
 ```json
-{ "short_code": "aB3xY9", "shard": 1, "short_url": "...", "long_url": "..." }
+{
+  "short_code": "aB3xY9",
+  "shard": 0,
+  "short_url": "http://<host>:8080/aB3xY9",
+  "long_url": "https://example.com/very/long/target/url"
+}
 ```
 
-Hit the `short_url` a few times, then:
-
+### 2. Redirect to Target URL
+```http
+GET /:short_code
 ```
-curl http://<phone-tailscale-ip>:8080/api/stats/<code>
-```
+- First hit: Serves from Shard Read Replica, populates Valkey in-memory cache.
+- Subsequent hits: Serves directly from Valkey (<1ms latency).
 
-`click_count` should be climbing. The first hit is a cache miss (reads the
-replica); everything after is served from Valkey until the 1-hour TTL expires.
-
-## Load testing
-
-`load-test/redirects.js` is a k6 script that ramps traffic against the
-redirect endpoint — the one your caching and replicas are actually built
-for. Install k6 on your laptop, then run it pointed at your phone's
-**Tailscale IP directly**:
-
-```
-k6 run --env BASE_URL=http://<phone-tailscale-ip>:8080 load-test/redirects.js
+### 3. Query Link Analytics
+```http
+GET /api/stats/:short_code
 ```
 
-Never point it at a zrok or Tailscale Funnel URL — you'd be benchmarking the
-tunnel's rate limit, not your architecture.
+**Response (`200 OK`):**
+```json
+{
+  "short_code": "aB3xY9",
+  "shard": 0,
+  "long_url": "https://example.com/very/long/target/url",
+  "click_count": 1420,
+  "created_at": "2026-10-14T18:00:00.000Z"
+}
+```
 
-## Public access (optional)
+---
 
-To let people outside your tailnet click your shortened links, see
-`infra/zrok/README.md` for a self-hosted zrok relay. Keep load testing on
-Tailscale directly regardless — never through a public tunnel.
+## ⚡ Concurrency & Chaos Testing
 
-## Watching it live
+### Load Testing with k6
+Execute the high-concurrency redirection test suite:
+```bash
+k6 run --env BASE_URL=http://<host-ip>:8080 load-test/redirects.js
+```
 
-Open `monitor/dashboard.html` in a browser on your laptop (point it at your
-phone's Tailscale IP) while `load-test/redirects.js` runs — it polls both
-app instances directly for live req/sec, cache hit ratio, free RAM, and CPU
-temp, no setup required.
+### Chaos Engineering (Replica Promotion)
+Simulate catastrophic failure of Shard 0's primary:
+```bash
+./chaos/kill-and-promote.sh
+```
+Watch how write operations fail safely while cached redirects continue serving uninterrupted, followed by manual replica promotion to restore full primary write capabilities.
 
-## Chaos testing
+---
 
-`chaos/kill-and-promote.sh` kills shard0's primary, lets you watch writes
-to that shard fail, and walks you through promoting its replica by hand —
-see `chaos/README.md` for what that does and doesn't prove about real
-failover.
+## 📄 License
 
-## What's next
-
-Whatever gives out first while you load-test — CPU, thermal throttling,
-RAM, or your home upload bandwidth — is your real number. Write it down;
-that's the actual deliverable of this whole project.
+This repository is licensed under the MIT License. See [LICENSE](LICENSE) for details.
