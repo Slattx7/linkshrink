@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<!--
+  Open this file directly in a browser on your laptop (double-click it, or
+  File > Open). Point it at your phone's Tailscale IP below. It polls both
+  app instances' /metrics endpoints directly, bypassing nginx, once a
+  second — no server, no build step, no dependencies.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>linkshrink — live</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0d1117; color: #e6edf3; padding: 24px; }
+  h1 { font-size: 16px; color: #8b949e; font-weight: 500; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 12px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+  .label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+  .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+  .instance { margin-top: 28px; }
+  .instance h2 { font-size: 14px; color: #8b949e; font-weight: 500; }
+  canvas { background: #161b22; border-radius: 8px; margin-top: 16px; width: 100%; }
+  input { background: #161b22; color: #e6edf3; border: 1px solid #30363d; padding: 6px 10px; border-radius: 6px; font-size: 14px; }
+  .warn { color: #f85149; }
+</style>
+</head>
+<body>
+<h1>linkshrink — live (polls both app instances directly, bypassing nginx)</h1>
+<label>Phone Tailscale IP: <input id="host" value="100.x.x.x" size="16"></label>
+
+<div id="instances"></div>
+<canvas id="chart" width="900" height="160"></canvas>
+
+<script>
+const PORTS = [3000, 3001];
+const history = { 3000: [], 3001: [] };
+const lastCount = { 3000: null, 3001: null };
+const MAX_POINTS = 60;
+const colors = { 3000: '#58a6ff', 3001: '#3fb950' };
+
+async function poll() {
+  const host = document.getElementById('host').value;
+  let html = '';
+  for (const port of PORTS) {
+    try {
+      const res = await fetch(`http://${host}:${port}/metrics`);
+      const m = await res.json();
+      const rps = lastCount[port] === null ? 0 : Math.max(0, m.requests - lastCount[port]);
+      lastCount[port] = m.requests;
+      history[port].push(rps);
+      if (history[port].length > MAX_POINTS) history[port].shift();
+
+      html += `
+        <div class="instance">
+          <h2>Instance :${port} — pid ${m.pid}, up ${m.uptimeSeconds}s</h2>
+          <div class="grid">
+            <div class="card"><div class="label">Req/sec</div><div class="value">${rps}</div></div>
+            <div class="card"><div class="label">Total requests</div><div class="value">${m.requests}</div></div>
+            <div class="card"><div class="label">Cache hit ratio</div><div class="value">${(m.cacheHitRatio * 100).toFixed(0)}%</div></div>
+            <div class="card"><div class="label">Free RAM</div><div class="value">${m.freeMemMB}MB</div></div>
+            <div class="card"><div class="label">Load avg (1m)</div><div class="value">${m.loadAvg[0].toFixed(2)}</div></div>
+            <div class="card"><div class="label">CPU temp</div><div class="value">${m.cpuTempC !== null ? m.cpuTempC.toFixed(1) + '°C' : 'n/a'}</div></div>
+          </div>
+        </div>`;
+    } catch (err) {
+      html += `<div class="instance"><h2>Instance :${port}</h2><p class="warn">unreachable — check the IP above and that nginx/the app are running</p></div>`;
+    }
+  }
+  document.getElementById('instances').innerHTML = html;
+  drawChart();
+}
+
+function drawChart() {
+  const canvas = document.getElementById('chart');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  let max = 1;
+  for (const port of PORTS) max = Math.max(max, ...history[port], 1);
+  for (const port of PORTS) {
+    const data = history[port];
+    if (data.length < 2) continue;
+    ctx.beginPath();
+    ctx.strokeStyle = colors[port];
+    ctx.lineWidth = 2;
+    data.forEach((v, i) => {
+      const x = (i / (MAX_POINTS - 1)) * canvas.width;
+      const y = canvas.height - (v / max) * (canvas.height - 20) - 10;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+}
+
+setInterval(poll, 1000);
+poll();
+</script>
+</body>
+</html>
